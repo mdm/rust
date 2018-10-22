@@ -181,6 +181,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
         constant
             .and_then(|c| {
                 let field_ty = c.ty.builtin_index().unwrap();
+                let layout = bx.cx.layout_of(field_ty);
                 let fields = match c.ty.sty {
                     ty::Array(_, n) => n.unwrap_usize(bx.tcx()),
                     ref other => bug!("invalid simd shuffle type: {}", other),
@@ -194,14 +195,17 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         mir::Field::new(field as usize),
                         c,
                     )?;
-                    if let Some(prim) = field.val.try_to_scalar() {
-                        let layout = bx.cx.layout_of(field_ty);
+                    // FIXME(oli-obk): are these indices always usize?
+                    if let Some(prim) = field.val.try_to_bits(bx.tcx(), layout) {
                         let scalar = match layout.abi {
                             layout::Abi::Scalar(ref x) => x,
                             _ => bug!("from_const: invalid ByVal layout: {:#?}", layout)
                         };
                         Ok(scalar_to_llvm(
-                            bx.cx, prim, scalar,
+                            bx.cx, Scalar::Bits {
+                                bits: prim,
+                                size: layout.size.bytes() as u8,
+                            }, scalar,
                             layout.immediate_llvm_type(bx.cx),
                         ))
                     } else {

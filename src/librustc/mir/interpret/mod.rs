@@ -28,13 +28,14 @@ pub use self::value::{Scalar, ConstValue};
 use std::fmt;
 use mir;
 use hir::def_id::DefId;
-use ty::{self, TyCtxt, Instance};
+use ty::{self, TyCtxt, Instance, Ty, ParamEnvAnd};
 use ty::layout::{self, Align, HasDataLayout, Size};
 use middle::region;
 use std::iter;
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::hash::Hash;
+use std::cmp;
+use std::hash::{Hash, Hasher};
 use syntax::ast::Mutability;
 use rustc_serialize::{Encoder, Decodable, Encodable};
 use rustc_data_structures::sorted_map::SortedMap;
@@ -217,8 +218,55 @@ impl<'tcx, Tag> Pointer<Tag> {
 }
 
 
-#[derive(Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct AllocId(pub u64);
+
+impl Eq for AllocId {}
+
+impl Hash for AllocId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        ty::tls::with(|tcx| {
+            let alloc_type = tcx.alloc_map.lock().get(*self);
+            match alloc_type {
+                Some(alloc_type) => alloc_type.hash(state),
+                None => self.0.hash(state),
+            }
+        })
+    }
+}
+
+impl PartialEq for AllocId {
+    fn eq(&self, other: &Self) -> bool {
+        ty::tls::with(|tcx| {
+            let (s, o) = {
+                let map = tcx.alloc_map.lock();
+                (map.get(*self), map.get(*other))
+            };
+            s == o
+        })
+    }
+}
+
+impl Ord for AllocId {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        match self.partial_cmp(other) {
+            Some(ord) => ord,
+            None => self.0.cmp(&other.0)
+        }
+    }
+}
+
+impl PartialOrd for AllocId {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        ty::tls::with(|tcx| {
+            let (s, o) = {
+                let map = tcx.alloc_map.lock();
+                (map.get(*self)?, map.get(*other)?)
+            };
+            s.partial_cmp(&o)
+        })
+    }
+}
 
 impl ::rustc_serialize::UseSpecializedEncodable for AllocId {}
 impl ::rustc_serialize::UseSpecializedDecodable for AllocId {}
@@ -427,7 +475,7 @@ impl fmt::Display for AllocId {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, RustcDecodable, RustcEncodable)]
 pub enum AllocType<'tcx, M> {
     /// The alloc id is used as a function pointer
     Function(Instance<'tcx>),
@@ -440,7 +488,7 @@ pub enum AllocType<'tcx, M> {
 
 pub struct AllocMap<'tcx, M> {
     /// Lets you know what an AllocId refers to
-    id_to_type: FxHashMap<AllocId, AllocType<'tcx, M>>,
+    id_to_type: FxHashMap<u64, AllocType<'tcx, M>>,
 
     /// Used to ensure that functions and statics only get one associated AllocId
     type_interner: FxHashMap<AllocType<'tcx, M>, AllocId>,
@@ -479,7 +527,7 @@ impl<'tcx, M: fmt::Debug + Eq + Hash + Clone> AllocMap<'tcx, M> {
         }
         let id = self.reserve();
         debug!("creating alloc_type {:?} with id {}", alloc_type, id);
-        self.id_to_type.insert(id, alloc_type.clone());
+        self.id_to_type.insert(id.0, alloc_type.clone());
         self.type_interner.insert(alloc_type, id);
         id
     }
@@ -492,7 +540,7 @@ impl<'tcx, M: fmt::Debug + Eq + Hash + Clone> AllocMap<'tcx, M> {
     }
 
     pub fn get(&self, id: AllocId) -> Option<AllocType<'tcx, M>> {
-        self.id_to_type.get(&id).cloned()
+        self.id_to_type.get(&id.0).cloned()
     }
 
     pub fn unwrap_memory(&self, id: AllocId) -> M {
@@ -513,13 +561,13 @@ impl<'tcx, M: fmt::Debug + Eq + Hash + Clone> AllocMap<'tcx, M> {
     }
 
     pub fn set_id_memory(&mut self, id: AllocId, mem: M) {
-        if let Some(old) = self.id_to_type.insert(id, AllocType::Memory(mem)) {
+        if let Some(old) = self.id_to_type.insert(id.0, AllocType::Memory(mem)) {
             bug!("tried to set allocation id {}, but it was already existing as {:#?}", id, old);
         }
     }
 
     pub fn set_id_same_memory(&mut self, id: AllocId, mem: M) {
-       self.id_to_type.insert_same(id, AllocType::Memory(mem));
+       self.id_to_type.insert_same(id.0, AllocType::Memory(mem));
     }
 }
 
@@ -545,7 +593,7 @@ pub struct Allocation<Tag=(),Extra=()> {
     pub extra: Extra,
 }
 
-impl<Tag, Extra: Default> Allocation<Tag, Extra> {
+impl<Tag: Copy, Extra: Default> Allocation<Tag, Extra> {
     /// Creates a read-only allocation initialized by the given bytes
     pub fn from_bytes(slice: &[u8], align: Align) -> Self {
         let mut undef_mask = UndefMask::new(Size::ZERO);
@@ -574,6 +622,145 @@ impl<Tag, Extra: Default> Allocation<Tag, Extra> {
             mutability: Mutability::Mutable,
             extra: Extra::default(),
         }
+    }
+
+    #[inline]
+    pub fn size(&self) -> Size {
+        Size::from_bytes(self.bytes.len() as u64)
+    }
+
+    pub fn check_align(
+        &self,
+        offset: Size,
+        required_align: Align,
+    ) -> EvalResult<'tcx> {
+        if self.align.abi() < required_align.abi() {
+            return err!(AlignmentCheckFailed {
+                has: self.align,
+                required: required_align,
+            });
+        }
+        let offset = offset.bytes();
+        if offset % required_align.abi() == 0 {
+            Ok(())
+        } else {
+            let has = offset % required_align.abi();
+            err!(AlignmentCheckFailed {
+                has: Align::from_bytes(has, has).unwrap(),
+                required: required_align,
+            })
+        }
+    }
+
+    pub fn check_bounds(
+        &self,
+        offset: Size,
+        size: Size,
+        access: bool,
+    ) -> EvalResult<'tcx> {
+        let end = offset + size;
+        let allocation_size = self.size();
+        if end > allocation_size {
+            err!(PointerOutOfBounds { offset, access, allocation_size })
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_defined(
+        &self,
+        offset: Size,
+        size: Size,
+    ) -> EvalResult<'tcx> {
+        self.undef_mask.is_range_defined(
+            offset,
+            offset + size,
+        ).or_else(|idx| err!(ReadUndefBytes(idx)))
+    }
+
+    pub fn check_relocations(
+        &self,
+        hdl: impl HasDataLayout,
+        offset: Size,
+        size: Size,
+    ) -> EvalResult<'tcx> {
+        if self.relocations(hdl, offset, size).len() != 0 {
+            err!(ReadPointerAsBytes)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn relocations(
+        &self,
+        hdl: impl HasDataLayout,
+        offset: Size,
+        size: Size,
+    ) -> &[(Size, (Tag, AllocId))] {
+        // We have to go back `pointer_size - 1` bytes, as that one would still overlap with
+        // the beginning of this range.
+        let start = offset.bytes().saturating_sub(hdl.data_layout().pointer_size.bytes() - 1);
+        let end = offset + size; // this does overflow checking
+        self.relocations.range(Size::from_bytes(start)..end)
+    }
+
+    pub fn get_bytes(
+        &self,
+        hdl: impl HasDataLayout,
+        offset: Size,
+        size: Size,
+        required_align: Align,
+    ) -> EvalResult<'tcx, &[u8]> {
+        self.check_align(offset, required_align)?;
+        self.check_bounds(offset, size, true)?;
+        self.check_defined(offset, size)?;
+        self.check_relocations(hdl, offset, size)?;
+        Ok(self.bytes_ignoring_relocations_and_undef(offset, size))
+    }
+
+    pub fn read_bits(
+        &self,
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        offset: Size,
+        ty: ParamEnvAnd<'tcx, Ty<'tcx>>,
+    ) -> EvalResult<'tcx, u128> {
+        let ty = tcx.lift_to_global(&ty).unwrap();
+        let layout = tcx.layout_of(ty).unwrap_or_else(|e| {
+            panic!("could not compute layout for {:?}: {:?}", ty, e)
+        });
+        let bytes = self.get_bytes(tcx, offset, layout.size, layout.align)?;
+        Ok(read_target_uint(tcx.data_layout.endian, bytes).unwrap())
+    }
+
+    pub fn read_scalar(
+        &self,
+        hdl: impl HasDataLayout,
+        offset: Size,
+        size: Size,
+        align: Align,
+    ) -> EvalResult<'tcx, Scalar<Tag>> {
+        self.check_align(offset, align)?;
+        self.check_bounds(offset, size, true)?;
+        self.check_defined(offset, size)?;
+        let bytes = self.bytes_ignoring_relocations_and_undef(offset, size);
+        let int = read_target_uint(hdl.data_layout().endian, &bytes).unwrap();
+        match self.relocations(hdl, offset, size) {
+            &[(_, (tag, alloc_id))] if size == hdl.data_layout().pointer_size => {
+                Ok(Pointer::new_with_tag(alloc_id, Size::from_bytes(int as u64), tag).into())
+            },
+            &[] => Ok(Scalar::Bits {
+                bits: int,
+                size: size.bytes() as u8,
+            }),
+            _ => err!(ReadPointerAsBytes),
+        }
+    }
+
+    fn bytes_ignoring_relocations_and_undef(&self, offset: Size, size: Size) -> &[u8] {
+        let end = offset + size;
+        let offset = offset.bytes() as usize;
+        let end = end.bytes() as usize;
+        &self.bytes[offset..end]
     }
 }
 

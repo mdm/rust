@@ -12,7 +12,7 @@
 
 use hir::def_id::DefId;
 
-use mir::interpret::ConstValue;
+use mir::interpret::{ConstValue, Allocation, write_target_uint};
 use middle::region;
 use polonius_engine::Atom;
 use rustc_data_structures::indexed_vec::Idx;
@@ -20,7 +20,6 @@ use ty::subst::{Substs, Subst, Kind, UnpackedKind};
 use ty::{self, AdtDef, TypeFlags, Ty, TyCtxt, TypeFoldable};
 use ty::{List, TyS, ParamEnvAnd, ParamEnv};
 use util::captures::Captures;
-use mir::interpret::{Scalar, Pointer};
 
 use std::iter;
 use std::cmp::Ordering;
@@ -1970,43 +1969,52 @@ impl<'tcx> Const<'tcx> {
     }
 
     #[inline]
-    pub fn from_scalar(
-        tcx: TyCtxt<'_, '_, 'tcx>,
-        val: Scalar,
-        ty: Ty<'tcx>,
-    ) -> &'tcx Self {
-        Self::from_const_value(tcx, ConstValue::Scalar(val), ty)
-    }
-
-    #[inline]
     pub fn from_bits(
         tcx: TyCtxt<'_, '_, 'tcx>,
         bits: u128,
         ty: ParamEnvAnd<'tcx, Ty<'tcx>>,
     ) -> &'tcx Self {
         let ty = tcx.lift_to_global(&ty).unwrap();
-        let size = tcx.layout_of(ty).unwrap_or_else(|e| {
-            panic!("could not compute layout for {:?}: {:?}", ty, e)
-        }).size;
-        let shift = 128 - size.bits();
-        let truncated = (bits << shift) >> shift;
-        assert_eq!(truncated, bits, "from_bits called with untruncated value");
-        Self::from_scalar(tcx, Scalar::Bits { bits, size: size.bytes() as u8 }, ty.value)
+        let layout = tcx.layout_of(ty).unwrap_or_else(|e| {
+            // FIXME: add delay_span_bug call, we can only get here if there are errors
+            // we produce a weird dummy layout with somewhat sane values
+            error!("failed to compute layout of {:?}: {:?}", ty, e);
+            let mut layout = tcx.layout_of(ParamEnv::reveal_all().and(tcx.types.u128)).unwrap();
+            layout.ty = ty.value;
+            layout
+        });
+        let mut bytes = [0_u8; 16];
+        let endian = tcx.data_layout.endian;
+        write_target_uint(endian, &mut bytes, bits).unwrap();
+        Self::from_bytes(tcx, &bytes[0..(layout.size.bytes() as usize)], layout)
     }
 
     #[inline]
-    pub fn zero_sized(tcx: TyCtxt<'_, '_, 'tcx>, ty: Ty<'tcx>) -> &'tcx Self {
-        Self::from_scalar(tcx, Scalar::Bits { bits: 0, size: 0 }, ty)
+    fn from_bytes(
+        tcx: TyCtxt<'_, '_, 'tcx>,
+        bytes: &[u8],
+        layout: ty::layout::TyLayout<'tcx>,
+    ) -> &'tcx Self {
+        let alloc = Allocation::from_bytes(&bytes, layout.align);
+        let const_val = ConstValue::from_allocation(tcx, alloc);
+        Self::from_const_value(tcx, const_val, layout.ty)
+    }
+
+    #[inline]
+    pub fn fn_def(tcx: TyCtxt<'_, '_, 'tcx>, ty: Ty<'tcx>) -> &'tcx Self {
+        let alloc = Allocation::from_bytes(&[], ty::layout::Align::from_bytes(1, 1).unwrap());
+        let const_val = ConstValue::from_allocation(tcx, alloc);
+        Self::from_const_value(tcx, const_val, ty)
     }
 
     #[inline]
     pub fn from_bool(tcx: TyCtxt<'_, '_, 'tcx>, v: bool) -> &'tcx Self {
-        Self::from_bits(tcx, v as u128, ParamEnv::empty().and(tcx.types.bool))
+        Self::from_bits(tcx, v as u128, ParamEnv::reveal_all().and(tcx.types.bool))
     }
 
     #[inline]
     pub fn from_usize(tcx: TyCtxt<'_, '_, 'tcx>, n: u64) -> &'tcx Self {
-        Self::from_bits(tcx, n as u128, ParamEnv::empty().and(tcx.types.usize))
+        Self::from_bits(tcx, n as u128, ParamEnv::reveal_all().and(tcx.types.usize))
     }
 
     #[inline]
@@ -2019,13 +2027,8 @@ impl<'tcx> Const<'tcx> {
             return None;
         }
         let ty = tcx.lift_to_global(&ty).unwrap();
-        let size = tcx.layout_of(ty).ok()?.size;
-        self.val.try_to_bits(size)
-    }
-
-    #[inline]
-    pub fn to_ptr(&self) -> Option<Pointer> {
-        self.val.try_to_ptr()
+        let layout = tcx.layout_of(ty).ok()?;
+        self.val.try_to_bits(tcx, layout)
     }
 
     #[inline]
@@ -2036,13 +2039,13 @@ impl<'tcx> Const<'tcx> {
     ) -> Option<u128> {
         assert_eq!(self.ty, ty.value);
         let ty = tcx.lift_to_global(&ty).unwrap();
-        let size = tcx.layout_of(ty).ok()?.size;
-        self.val.try_to_bits(size)
+        let layout = tcx.layout_of(ty).ok()?;
+        self.val.try_to_bits(tcx, layout)
     }
 
     #[inline]
     pub fn assert_bool(&self, tcx: TyCtxt<'_, '_, '_>) -> Option<bool> {
-        self.assert_bits(tcx, ParamEnv::empty().and(tcx.types.bool)).and_then(|v| match v {
+        self.assert_bits(tcx, ParamEnv::reveal_all().and(tcx.types.bool)).and_then(|v| match v {
             0 => Some(false),
             1 => Some(true),
             _ => None,
@@ -2051,17 +2054,16 @@ impl<'tcx> Const<'tcx> {
 
     #[inline]
     pub fn assert_usize(&self, tcx: TyCtxt<'_, '_, '_>) -> Option<u64> {
-        self.assert_bits(tcx, ParamEnv::empty().and(tcx.types.usize)).map(|v| v as u64)
+        self.assert_bits(tcx, ParamEnv::reveal_all().and(tcx.types.usize)).map(|v| v as u64)
     }
 
     #[inline]
     pub fn unwrap_bits(
         &self,
         tcx: TyCtxt<'_, '_, '_>,
-        ty: ParamEnvAnd<'tcx, Ty<'tcx>>,
     ) -> u128 {
-        self.assert_bits(tcx, ty).unwrap_or_else(||
-            bug!("expected bits of {}, got {:#?}", ty.value, self))
+        self.assert_bits(tcx, ParamEnv::empty().and(self.ty)).unwrap_or_else(||
+            bug!("expected bits of {}, got {:#?}", self.ty, self))
     }
 
     #[inline]

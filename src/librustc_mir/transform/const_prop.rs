@@ -259,24 +259,28 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
         source_info: SourceInfo,
     ) -> Option<Const<'tcx>> {
         self.ecx.tcx.span = source_info.span;
-        match self.ecx.const_to_op(c.literal) {
-            Ok(op) => {
-                Some((op, c.span))
+        let error = match self.ecx.const_to_mplace(c.literal) {
+            Ok(mplacety) => match self.ecx.try_read_value_from_mplace(mplacety) {
+                Err(error) => error,
+                Ok(Some(val)) => return Some((OpTy {
+                    op: interpret::Operand::Immediate(val),
+                    layout: mplacety.layout,
+                }, c.span)),
+                Ok(None) => return Some((mplacety.into(), c.span)),
             },
-            Err(error) => {
-                let (stacktrace, span) = self.ecx.generate_stacktrace(None);
-                let err = ConstEvalErr {
-                    span,
-                    error,
-                    stacktrace,
-                };
-                err.report_as_error(
-                    self.tcx.at(source_info.span),
-                    "could not evaluate constant",
-                );
-                None
-            },
-        }
+            Err(error) => error,
+        };
+        let (stacktrace, span) = self.ecx.generate_stacktrace(None);
+        let err = ConstEvalErr {
+            span,
+            error,
+            stacktrace,
+        };
+        err.report_as_error(
+            self.tcx.at(source_info.span),
+            "could not evaluate constant",
+        );
+        None
     }
 
     fn eval_place(&mut self, place: &Place<'tcx>, source_info: SourceInfo) -> Option<Const<'tcx>> {
@@ -314,7 +318,7 @@ impl<'a, 'mir, 'tcx> ConstPropagator<'a, 'mir, 'tcx> {
                     eval_promoted(this.tcx, cid, this.mir, this.param_env)
                 })?;
                 trace!("evaluated promoted {:?} to {:?}", promoted, res);
-                Some((res, source_info.span))
+                Some((res.into(), source_info.span))
             },
             _ => None,
         }

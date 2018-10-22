@@ -445,7 +445,7 @@ impl<'a, 'tcx> CloneShimBuilder<'a, 'tcx> {
             span: self.span,
             ty: func_ty,
             user_ty: None,
-            literal: ty::Const::zero_sized(self.tcx, func_ty),
+            literal: ty::Const::fn_def(self.tcx, func_ty),
         });
 
         let ref_loc = self.make_place(
@@ -733,7 +733,7 @@ fn build_call_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                 span,
                 ty,
                 user_ty: None,
-                literal: ty::Const::zero_sized(tcx, ty),
+                literal: ty::Const::fn_def(tcx, ty),
              }),
              vec![rcvr])
         }

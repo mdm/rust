@@ -375,13 +375,6 @@ for ::mir::interpret::ConstValue<'gcx> {
                 def_id.hash_stable(hcx, hasher);
                 substs.hash_stable(hcx, hasher);
             }
-            Scalar(val) => {
-                val.hash_stable(hcx, hasher);
-            }
-            ScalarPair(a, b) => {
-                a.hash_stable(hcx, hasher);
-                b.hash_stable(hcx, hasher);
-            }
             ByRef(id, alloc, offset) => {
                 id.hash_stable(hcx, hasher);
                 alloc.hash_stable(hcx, hasher);
@@ -463,13 +456,18 @@ impl<'a> HashStable<StableHashingContext<'a>> for mir::interpret::Allocation {
         hcx: &mut StableHashingContext<'a>,
         hasher: &mut StableHasher<W>,
     ) {
-        self.bytes.hash_stable(hcx, hasher);
-        for reloc in self.relocations.iter() {
+        trace!("hashing allocation {:?}", self);
+        let mir::interpret::Allocation {
+            bytes, relocations, undef_mask, align, mutability,
+            extra: (),
+        } = self;
+        bytes.hash_stable(hcx, hasher);
+        for reloc in relocations.iter() {
             reloc.hash_stable(hcx, hasher);
         }
-        self.undef_mask.hash_stable(hcx, hasher);
-        self.align.hash_stable(hcx, hasher);
-        self.mutability.hash_stable(hcx, hasher);
+        undef_mask.hash_stable(hcx, hasher);
+        align.hash_stable(hcx, hasher);
+        mutability.hash_stable(hcx, hasher);
     }
 }
 
@@ -512,7 +510,7 @@ for ::mir::interpret::EvalErrorKind<'gcx, O> {
                                           hasher: &mut StableHasher<W>) {
         use mir::interpret::EvalErrorKind::*;
 
-        mem::discriminant(&self).hash_stable(hcx, hasher);
+        mem::discriminant(self).hash_stable(hcx, hasher);
 
         match *self {
             FunctionArgCountMismatch |
@@ -577,11 +575,11 @@ for ::mir::interpret::EvalErrorKind<'gcx, O> {
             NoMirFor(ref s) => s.hash_stable(hcx, hasher),
             UnterminatedCString(ptr) => ptr.hash_stable(hcx, hasher),
             PointerOutOfBounds {
-                ptr,
+                offset,
                 access,
                 allocation_size,
             } => {
-                ptr.hash_stable(hcx, hasher);
+                offset.hash_stable(hcx, hasher);
                 access.hash_stable(hcx, hasher);
                 allocation_size.hash_stable(hcx, hasher)
             },

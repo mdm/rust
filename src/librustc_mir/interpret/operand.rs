@@ -13,12 +13,12 @@
 
 use std::convert::TryInto;
 
-use rustc::{mir, ty};
+use rustc::mir;
 use rustc::ty::layout::{self, Size, LayoutOf, TyLayout, HasDataLayout, IntegerExt};
 
 use rustc::mir::interpret::{
-    GlobalId, AllocId,
-    ConstValue, Pointer, Scalar,
+    AllocId,
+    Pointer, Scalar,
     EvalResult, EvalErrorKind
 };
 use super::{EvalContext, Machine, MemPlace, MPlaceTy, MemoryKind};
@@ -338,7 +338,7 @@ impl<'tcx, Tag> OpTy<'tcx, Tag>
 // Use the existing layout if given (but sanity check in debug mode),
 // or compute the layout.
 #[inline(always)]
-fn from_known_layout<'tcx>(
+pub(super) fn from_known_layout<'tcx>(
     layout: Option<TyLayout<'tcx>>,
     compute: impl FnOnce() -> EvalResult<'tcx, TyLayout<'tcx>>
 ) -> EvalResult<'tcx, TyLayout<'tcx>> {
@@ -359,7 +359,7 @@ fn from_known_layout<'tcx>(
 impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
     /// Try reading a value in memory; this is interesting particularily for ScalarPair.
     /// Return None if the layout does not permit loading this as a value.
-    pub(super) fn try_read_value_from_mplace(
+    pub(crate) fn try_read_value_from_mplace(
         &self,
         mplace: MPlaceTy<'tcx, M::PointerTag>,
     ) -> EvalResult<'tcx, Option<Value<M::PointerTag>>> {
@@ -403,7 +403,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
     /// Note that for a given layout, this operation will either always fail or always
     /// succeed!  Whether it succeeds depends on whether the layout can be represented
     /// in a `Value`, not on which data is stored there currently.
-    pub(crate) fn try_read_value(
+    pub(super)fn try_read_value(
         &self,
         src: OpTy<'tcx, M::PointerTag>,
     ) -> EvalResult<'tcx, Result<Value<M::PointerTag>, MemPlace<M::PointerTag>>> {
@@ -628,11 +628,11 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                 self.eval_place_to_op(place, layout)?,
 
             Constant(ref constant) => {
-                let layout = from_known_layout(layout, || {
+                let layout = super::operand::from_known_layout(layout, || {
                     let ty = self.monomorphize(mir_op.ty(self.mir(), *self.tcx), self.substs());
                     self.layout_of(ty)
                 })?;
-                let op = self.const_value_to_op(constant.literal.val)?;
+                let op = Operand::Indirect(self.const_value_to_mplace(constant.literal.val)?);
                 OpTy { op, layout }
             }
         };
@@ -648,49 +648,6 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
         ops.into_iter()
             .map(|op| self.eval_operand(op, None))
             .collect()
-    }
-
-    // Also used e.g. when miri runs into a constant.
-    pub(super) fn const_value_to_op(
-        &self,
-        val: ConstValue<'tcx>,
-    ) -> EvalResult<'tcx, Operand<M::PointerTag>> {
-        trace!("const_value_to_op: {:?}", val);
-        match val {
-            ConstValue::Unevaluated(def_id, substs) => {
-                let instance = self.resolve(def_id, substs)?;
-                self.global_to_op(GlobalId {
-                    instance,
-                    promoted: None,
-                })
-            }
-            ConstValue::ByRef(id, alloc, offset) => {
-                // We rely on mutability being set correctly in that allocation to prevent writes
-                // where none should happen -- and for `static mut`, we copy on demand anyway.
-                Ok(Operand::Indirect(
-                    MemPlace::from_ptr(Pointer::new(id, offset), alloc.align)
-                ).with_default_tag())
-            },
-            ConstValue::ScalarPair(a, b) =>
-                Ok(Operand::Immediate(Value::ScalarPair(a.into(), b.into())).with_default_tag()),
-            ConstValue::Scalar(x) =>
-                Ok(Operand::Immediate(Value::Scalar(x.into())).with_default_tag()),
-        }
-    }
-    pub fn const_to_op(
-        &self,
-        cnst: &ty::Const<'tcx>,
-    ) -> EvalResult<'tcx, OpTy<'tcx, M::PointerTag>> {
-        let op = self.const_value_to_op(cnst.val)?;
-        Ok(OpTy { op, layout: self.layout_of(cnst.ty)? })
-    }
-
-    pub(super) fn global_to_op(
-        &self,
-        gid: GlobalId<'tcx>
-    ) -> EvalResult<'tcx, Operand<M::PointerTag>> {
-        let cv = self.const_eval(gid)?;
-        self.const_value_to_op(cv.val)
     }
 
     /// Read discriminant, return the runtime value as well as the variant index.

@@ -851,7 +851,7 @@ fn method_callee<'a, 'gcx, 'tcx>(
         ty,
         span,
         kind: ExprKind::Literal {
-            literal: ty::Const::zero_sized(cx.tcx(), ty),
+            literal: ty::Const::fn_def(cx.tcx(), ty),
             user_ty,
         },
     }
@@ -910,7 +910,7 @@ fn convert_path_expr<'a, 'gcx, 'tcx>(cx: &mut Cx<'a, 'gcx, 'tcx>,
         Def::SelfCtor(..) => {
             let user_ty = user_substs_applied_to_def(cx, expr.hir_id, &def);
             ExprKind::Literal {
-                literal: ty::Const::zero_sized(
+                literal: ty::Const::fn_def(
                     cx.tcx,
                     cx.tables().node_id_to_type(expr.hir_id),
                 ),
